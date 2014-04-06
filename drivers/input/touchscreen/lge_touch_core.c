@@ -48,6 +48,29 @@
 #include <linux/input/pmic8xxx-pwrkey.h>
 #endif
 
+#ifdef CONFIG_TOUCHSCREEN_PREVENT_SLEEP
+static bool prevent_sleep_irq_wake_enabled = false;
+static void prevent_sleep_enable_irq_wake(unsigned int irq){
+	if(!prevent_sleep_irq_wake_enabled){
+		prevent_sleep_irq_wake_enabled = true;
+		enable_irq_wake(irq);
+		pr_info("irq_wake enabled\n");
+	}
+	else
+		pr_info("irq_wake already enabled\n");
+}
+
+static void prevent_sleep_disable_irq_wake(unsigned int irq){
+	if(prevent_sleep_irq_wake_enabled){
+		prevent_sleep_irq_wake_enabled = false;
+		disable_irq_wake(irq);
+		pr_info("irq_wake disabled\n");
+	}
+	else
+		pr_info("irq_wake already disabled\n");
+}
+#endif
+
 struct touch_device_driver*     touch_device_func;
 struct workqueue_struct*        touch_wq;
 
@@ -1971,11 +1994,7 @@ static int touch_probe(struct i2c_client *client,
 
 		ret = request_threaded_irq(client->irq, touch_irq_handler,
 				NULL,
-#ifdef CONFIG_TOUCHSCREEN_PREVENT_SLEEP
-		ts->pdata->role->irqflags | IRQF_ONESHOT | IRQF_NO_SUSPEND,
-#else
 		ts->pdata->role->irqflags | IRQF_ONESHOT,
-#endif
 			client->name, ts);
 
 		if (ret < 0) {
@@ -2169,7 +2188,7 @@ static void touch_early_suspend(struct early_suspend *h)
 	        touch_power_cntl(ts, ts->pdata->role->suspend_pwr);
 #ifdef CONFIG_TOUCHSCREEN_PREVENT_SLEEP
         } else {
-                enable_irq_wake(ts->client->irq);
+		prevent_sleep_enable_irq_wake(ts->client->irq);
 		release_all_ts_event(ts);
 	}
 #endif
@@ -2182,6 +2201,8 @@ static void touch_late_resume(struct early_suspend *h)
 #ifdef CONFIG_TOUCHSCREEN_PREVENT_SLEEP
 #if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE)
         bool prevent_sleep = false;
+	int int_pin = 0;
+	int next_work = 0;
 #endif
 #if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE)
         prevent_sleep = (s2w_switch == 1);
@@ -2225,7 +2246,25 @@ static void touch_late_resume(struct early_suspend *h)
 
 #ifdef CONFIG_TOUCHSCREEN_PREVENT_SLEEP
 	} else {
-		disable_irq_wake(ts->client->irq);
+		prevent_sleep_disable_irq_wake(ts->client->irq);
+		/* Interrupt pin check after IC init - avoid Touch lockup */
+		if (ts->pdata->role->operation_mode == INTERRUPT_MODE) {
+			int_pin = gpio_get_value(ts->pdata->int_pin);
+			next_work = atomic_read(&ts->next_work);
+
+			if (unlikely(int_pin != 1 && next_work <= 0)) {
+				TOUCH_INFO_MSG("WARN: [2w]Interrupt pin is low (Lockup detected) - next_work: %d, try_count: %d]\n",
+						next_work, ts->ic_init_err_cnt);
+				pr_warn("touch core: [2w]disable irqs!\n");
+				disable_irq(ts->client->irq);
+				pr_warn("touch core: [2w]release all Touch events!\n");
+				release_all_ts_event(ts);
+				pr_warn("touch core: [s2w]enable irqs!\n");
+				enable_irq(ts->client->irq);
+				pr_warn("touch core: [s2w]force IC init!\n");
+				touch_ic_init(ts);
+				}
+			}
 		if (s2w_error) {
 			s2w_error = false;
 			TOUCH_ERR_MSG("soft resetting device\n");
