@@ -98,7 +98,7 @@ static struct msm_mpdec_tuners {
 #endif
 };
 
-static unsigned int NwNs_Threshold[8] = {12, 0, 20, 7, 25, 10, 0, 18};
+static unsigned int NwNs_Threshold[8] = {12, 0, 25, 7, 30, 10, 0, 18};
 static unsigned int TwTs_Threshold[8] = {140, 0, 140, 190, 140, 190, 0, 190};
 
 extern unsigned int get_rq_info(void);
@@ -346,32 +346,46 @@ static int update_cpu_min_freq(struct cpufreq_policy *cpu_policy,
 }
 
 static void unboost_cpu(int cpu) {
+/* we don't use mpdec's cpu up/down funcs here to control offline, to be
+ * unboosted, cpus to avoid influencing mpdec's stats */
 	struct cpufreq_policy *cpu_policy = NULL;
+	bool cpu_mod = false;
 
-	if (cpu_online(cpu)) {
-		if (per_cpu(msm_mpdec_cpudata, cpu).is_boosted) {
-			if (mutex_trylock(&per_cpu(msm_mpdec_cpudata, cpu).unboost_mutex)) {
-				cpu_policy = cpufreq_cpu_get(cpu);
-				if (!cpu_policy) {
-					pr_debug(MPDEC_TAG"NULL policy on cpu %d\n", cpu);
-					return;
-				}
-#if DEBUG
-				pr_info(MPDEC_TAG"un boosted cpu%i to %lu", cpu, per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq);
-#endif
-				per_cpu(msm_mpdec_cpudata, cpu).is_boosted = false;
-				per_cpu(msm_mpdec_cpudata, cpu).revib_wq_running = false;
-				if ((cpu_policy->min != per_cpu(msm_mpdec_cpudata, cpu).boost_freq) &&
-					(cpu_policy->min != per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq)) {
-					pr_info(MPDEC_TAG"cpu%u min was changed while boosted (%lu->%u), using new min",
-						cpu, per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq, cpu_policy->min);
-					per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq = cpu_policy->min;
-				}
-				update_cpu_min_freq(cpu_policy, cpu, per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq);
-				cpufreq_cpu_put(cpu_policy);
-				mutex_unlock(&per_cpu(msm_mpdec_cpudata, cpu).unboost_mutex);
+	if (per_cpu(msm_mpdec_cpudata, cpu).is_boosted) {
+		if (mutex_trylock(&per_cpu(msm_mpdec_cpudata, cpu).unboost_mutex)) {
+			if (!cpu_online(cpu)) {
+				pr_info(MPDEC_TAG"cpu%i is to be unboosted but offline! Hotplugging...", cpu);
+				cpu_up(cpu);
+				cpu_mod = true;
 			}
+			cpu_policy = cpufreq_cpu_get(cpu);
+			if (!cpu_policy) {
+				pr_debug(MPDEC_TAG"NULL policy on cpu %d\n", cpu);
+				if (cpu_mod) {
+					pr_info(MPDEC_TAG"cpu%i was modified. Restoring state...", cpu);
+					cpu_down(cpu);
+				}
+				return;
+			}
+#if DEBUG
+			pr_info(MPDEC_TAG"un boosted cpu%i to %lu", cpu, per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq);
+#endif
+			per_cpu(msm_mpdec_cpudata, cpu).is_boosted = false;
+			per_cpu(msm_mpdec_cpudata, cpu).revib_wq_running = false;
+			if ((cpu_policy->min != per_cpu(msm_mpdec_cpudata, cpu).boost_freq) &&
+				(cpu_policy->min != per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq)) {
+				pr_info(MPDEC_TAG"cpu%u min was changed while boosted (%lu->%u), using new min",
+					cpu, per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq, cpu_policy->min);
+				per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq = cpu_policy->min;
+			}
+			update_cpu_min_freq(cpu_policy, cpu, per_cpu(msm_mpdec_cpudata, cpu).norm_min_freq);
+			cpufreq_cpu_put(cpu_policy);
+			mutex_unlock(&per_cpu(msm_mpdec_cpudata, cpu).unboost_mutex);
 		}
+	}
+	if (cpu_mod) {
+		pr_info(MPDEC_TAG"cpu%i was modified. Restoring state...", cpu);
+		cpu_down(cpu);
 	}
 
 	return;
@@ -529,6 +543,10 @@ static void msm_mpdec_suspend(struct work_struct * msm_mpdec_suspend_work) {
 #endif
 
 	if (!msm_mpdec_tuners_ins.scroff_single_core) {
+#ifdef CONFIG_MSM_MPDEC_INPUTBOOST_CPUMIN
+		for_each_possible_cpu(cpu)
+			unboost_cpu(cpu);
+#endif
 		pr_info(MPDEC_TAG"Screen -> off\n");
 		return;
 	}
@@ -556,8 +574,10 @@ static void msm_mpdec_resume(struct work_struct * msm_mpdec_suspend_work) {
 	is_screen_on = true;
 #endif
 
-	if (!mpdec_suspended)
+	if (!mpdec_suspended) {
+		pr_info(MPDEC_TAG"Screen -> on\n");
 		return;
+	}
 
 	mpdec_suspended = false;
 

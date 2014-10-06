@@ -33,7 +33,6 @@
 #include <asm/cputype.h>
 #include <asm/exception.h>
 #include <asm/idmap.h>
-
 #include <asm/topology.h>
 #include <asm/mmu_context.h>
 #include <asm/pgtable.h>
@@ -73,9 +72,30 @@ void __init smp_set_ops(struct smp_operations *ops)
 		smp_ops = *ops;
 };
 
-int __cpu_up(unsigned int cpu, struct task_struct *idle)
+int __cpu_up(unsigned int cpu)
 {
+	struct cpuinfo_arm *ci = &per_cpu(cpu_data, cpu);
+	struct task_struct *idle = ci->idle;
 	int ret;
+
+	/*
+	 * Spawn a new process manually, if not already done.
+	 * Grab a pointer to its task struct so we can mess with it
+	 */
+	if (!idle) {
+		idle = fork_idle(cpu);
+		if (IS_ERR(idle)) {
+			printk(KERN_ERR "CPU%u: fork() failed\n", cpu);
+			return PTR_ERR(idle);
+		}
+		ci->idle = idle;
+	} else {
+		/*
+		 * Since this idle thread is being re-used, call
+		 * init_idle() to reinitialize the thread structure.
+		 */
+		init_idle(idle, cpu);
+	}
 
 	/*
 	 * We need to tell the secondary core where to find
@@ -126,13 +146,13 @@ void __attribute__((weak)) __init platform_smp_prepare_cpus(unsigned int max_cpu
 		smp_ops.smp_prepare_cpus(max_cpus);
 }
 
-void __attribute__((weak)) platform_secondary_init(unsigned int cpu)
+void __attribute__((weak)) __cpuinit platform_secondary_init(unsigned int cpu)
 {
 	if (smp_ops.smp_secondary_init)
 		smp_ops.smp_secondary_init(cpu);
 }
 
-int __attribute__((weak)) boot_secondary(unsigned int cpu, struct task_struct *idle)
+int __attribute__((weak)) __cpuinit boot_secondary(unsigned int cpu, struct task_struct *idle)
 {
 	if (smp_ops.smp_boot_secondary)
 		return smp_ops.smp_boot_secondary(cpu, idle);
@@ -284,10 +304,8 @@ static void smp_store_cpu_info(unsigned int cpuid)
 
 	cpu_info->loops_per_jiffy = loops_per_jiffy;
 
-
 	store_cpu_topology(cpuid);
 }
-
 
 /*
  * This is the secondary CPU boot entry.  We're using this CPUs
@@ -365,6 +383,9 @@ void __init smp_cpus_done(unsigned int max_cpus)
 
 void __init smp_prepare_boot_cpu(void)
 {
+	unsigned int cpu = smp_processor_id();
+
+	per_cpu(cpu_data, cpu).idle = current;
 }
 
 void __init smp_prepare_cpus(unsigned int max_cpus)
@@ -675,6 +696,7 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
 
 void smp_send_reschedule(int cpu)
 {
+	BUG_ON(cpu_is_offline(cpu));
 	smp_cross_call(cpumask_of(cpu), IPI_RESCHEDULE);
 }
 
@@ -700,9 +722,9 @@ void smp_send_stop(void)
 		smp_cross_call(&mask, IPI_CPU_STOP);
 
 	/* Wait up to one second for other CPUs to stop */
-	timeout = USEC_PER_SEC;
+	timeout = MSEC_PER_SEC;
 	while (num_active_cpus() > 1 && timeout--)
-		udelay(1);
+		mdelay(1);
 
 	if (num_active_cpus() > 1)
 		pr_warning("SMP: failed to stop secondary CPUs\n");
