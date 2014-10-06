@@ -15,7 +15,9 @@
  *
  */
 
+#include <asm/cputime.h>
 #include <linux/kernel.h>
+#include <linux/kernel_stat.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/notifier.h>
@@ -23,6 +25,7 @@
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/spinlock.h>
+#include <linux/tick.h>
 #include <linux/device.h>
 #include <linux/slab.h>
 #include <linux/cpu.h>
@@ -144,6 +147,41 @@ void disable_cpufreq(void)
 }
 static LIST_HEAD(cpufreq_governor_list);
 static DEFINE_MUTEX(cpufreq_governor_mutex);
+
+static inline u64 get_cpu_idle_time_jiffy(unsigned int cpu, u64 *wall)
+{
+	u64 idle_time;
+	u64 cur_wall_time;
+	u64 busy_time;
+
+	cur_wall_time = jiffies64_to_cputime64(get_jiffies_64());
+
+	busy_time = kcpustat_cpu(cpu).cpustat[CPUTIME_USER];
+	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_SYSTEM];
+	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_IRQ];
+	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_SOFTIRQ];
+	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_STEAL];
+	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_NICE];
+
+	idle_time = cur_wall_time - busy_time;
+	if (wall)
+		*wall = cputime_to_usecs(cur_wall_time);
+
+	return cputime_to_usecs(idle_time);
+}
+
+u64 get_cpu_idle_time(unsigned int cpu, u64 *wall, int io_busy)
+{
+	u64 idle_time = get_cpu_idle_time_us(cpu, io_busy ? wall : NULL);
+
+	if (idle_time == -1ULL)
+		return get_cpu_idle_time_jiffy(cpu, wall);
+	else if (!io_busy)
+		idle_time += get_cpu_iowait_time_us(cpu, wall);
+
+	return idle_time;
+}
+EXPORT_SYMBOL_GPL(get_cpu_idle_time);
 
 static struct cpufreq_policy *__cpufreq_cpu_get(unsigned int cpu, int sysfs)
 {
@@ -1098,6 +1136,13 @@ static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
 		pr_debug("initialization failed\n");
 		goto err_unlock_policy;
 	}
+
+	/*
+	 * affected cpus must always be the one, which are online. We aren't
+	 * managing offline cpus here.
+	 */
+	cpumask_and(policy->cpus, policy->cpus, cpu_online_mask);
+
 	policy->user_policy.min = policy->min;
 	policy->user_policy.max = policy->max;
 
@@ -1204,10 +1249,10 @@ static int __cpufreq_remove_dev(struct device *dev, struct subsys_interface *sif
 #ifdef CONFIG_HOTPLUG_CPU
 	strncpy(per_cpu(cpufreq_policy_save, cpu).gov, data->governor->name,
 			CPUFREQ_NAME_LEN);
-	per_cpu(cpufreq_policy_save, cpu).min = data->min;
-	per_cpu(cpufreq_policy_save, cpu).max = data->max;
-	pr_debug("Saving CPU%d policy min %d and max %d\n",
-			cpu, data->min, data->max);
+	per_cpu(cpufreq_policy_save, cpu).min = data->user_policy.min;
+	per_cpu(cpufreq_policy_save, cpu).max = data->user_policy.max;
+	pr_debug("Saving CPU%d user policy min %d and max %d\n",
+			cpu, data->user_policy.min, data->user_policy.max);
 #endif
 
 	/* if we have other CPUs still registered, we need to unlink them,
@@ -1233,9 +1278,11 @@ static int __cpufreq_remove_dev(struct device *dev, struct subsys_interface *sif
 #ifdef CONFIG_HOTPLUG_CPU
 			strncpy(per_cpu(cpufreq_policy_save, j).gov,
 				data->governor->name, CPUFREQ_NAME_LEN);
-			per_cpu(cpufreq_policy_save, j).min = data->min;
-			per_cpu(cpufreq_policy_save, j).max = data->max;
-			pr_debug("Saving CPU%d policy min %d and max %d\n",
+			per_cpu(cpufreq_policy_save, j).min
+						= data->user_policy.min;
+			per_cpu(cpufreq_policy_save, j).max
+						= data->user_policy.max;
+			pr_debug("Saving CPU%d user policy min %d and max %d\n",
 					j, data->min, data->max);
 #endif
 			cpu_dev = get_cpu_device(j);
@@ -1614,10 +1661,6 @@ int __cpufreq_driver_target(struct cpufreq_policy *policy,
 
 	pr_debug("target for CPU %u: %u kHz, relation %u\n", policy->cpu,
 		target_freq, relation);
-
-	if (target_freq == policy->cur)
-		return 0;
-
 	if (cpu_online(policy->cpu) && cpufreq_driver->target)
 		retval = cpufreq_driver->target(policy, target_freq, relation);
 
@@ -1802,6 +1845,7 @@ int cpufreq_get_policy(struct cpufreq_policy *policy, unsigned int cpu)
 }
 EXPORT_SYMBOL(cpufreq_get_policy);
 
+
 /*
  * data   : current policy.
  * policy : policy to be set.
@@ -1810,7 +1854,6 @@ static int __cpufreq_set_policy(struct cpufreq_policy *data,
 				struct cpufreq_policy *policy)
 {
 	int ret = 0;
-	struct cpufreq_policy *cpu0_policy = NULL;
 
 	pr_debug("setting new policy for CPU %u: %u - %u kHz\n", policy->cpu,
 		policy->min, policy->max);
@@ -1846,17 +1889,8 @@ static int __cpufreq_set_policy(struct cpufreq_policy *data,
 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
 			CPUFREQ_NOTIFY, policy);
 
-	if (policy->cpu)
-	{
-		cpu0_policy = cpufreq_cpu_get(0);
-		data->min = cpu0_policy->min;
-		data->max = cpu0_policy->max;
-	}
-	else
-	{
-		data->min = policy->min;
-		data->max = policy->max;
-	}
+	data->min = policy->min;
+	data->max = policy->max;
 
 	pr_debug("new min and max freqs are %u - %u kHz\n",
 					data->min, data->max);
@@ -1877,11 +1911,7 @@ static int __cpufreq_set_policy(struct cpufreq_policy *data,
 				__cpufreq_governor(data, CPUFREQ_GOV_STOP);
 
 			/* start new governor */
-			if (policy->cpu && cpu0_policy)
-				data->governor = cpu0_policy->governor;
-			else
-				data->governor = policy->governor;
-
+			data->governor = policy->governor;
 			if (__cpufreq_governor(data, CPUFREQ_GOV_START)) {
 				/* new governor failed, so re-start old one */
 				pr_debug("starting governor %s failed\n",
